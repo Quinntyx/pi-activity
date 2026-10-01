@@ -13,14 +13,20 @@
     "status-line"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://git.quinntyx.dev/quinntyx/pi-activity.git"
+  },
   "files": [
     "API.md",
+    "MIGRATION.md",
     "extensions/index.ts",
     "extensions/bash-command.ts",
     "config/config.example.json",
     "README.md"
   ],
   "scripts": {
+    "test": "node --test scripts/activity.test.mjs",
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/index.ts"
   },
   "peerDependencies": {

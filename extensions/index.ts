@@ -4,8 +4,8 @@
  * Extracted from pi-tool-tree (pi-claude-code-ui): the activity tracker, the
  * `activity` tool parameter wrapping, the label normalization, the shimmer
  * painter, the published query API, and the footer status line. Rendering of
- * the grouped transcript itself stays in pi-tool-tree; that extension consumes
- * this one's API (see API.md).
+ * the grouped transcript is not part of this plugin. pi-tool-tree is used only
+ * as a reference; consumers can render this API however they want (see API.md).
  *
  * Three things live here:
  *
@@ -16,8 +16,8 @@
  *    grouped rows (RPC, headless, tests).
  *
  * 2. Wrapping — the `activity` schema parameter the model tags every call
- *    with, injected into tool schemas via `wrapTool` (and applied by
- *    pi-tool-tree to its own core tools).
+ *    with, injected into native tool schemas and opt-in tools via `wrapTool`.
+ *    Existing extensions' tool definitions and custom renderers are left alone.
  *
  * 3. Presentation helpers — the shimmer painter (`shimmerText`) and the
  *    footer status line, so other surfaces get the exact same label sweep and
@@ -28,7 +28,17 @@
 
 import { existsSync, readFileSync } from "node:fs";
 
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import {
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
+	type ExtensionAPI,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 import { formatBashDuration } from "./bash-command";
@@ -173,8 +183,6 @@ let sessionWorkedTotalMs = 0;
 // Turns fired by the current agent run — pi's turn unit: one model response plus
 // the tool calls it makes. Reset whenever a new run starts.
 let currentRunTurnCount = 0;
-/** Last known run turn count, used for history rows that carry no stamp. */
-let lastRunTurnCount = 0;
 let lastThinkingBlockDurationMs: number | undefined;
 let thinkingBlockStartMs = 0;
 /** True from thinking_start until thinking_end on the current assistant stream. */
@@ -183,17 +191,14 @@ let thinkingBlockInFlight = false;
 function seedSessionTiming(messages: any[]): void {
 	let workedTotalMs = 0;
 	let runTurnCount = 0;
-	let runHasAssistant = false;
 	for (const message of messages) {
 		if (!message || typeof message !== "object") continue;
 		if (message.role === "user") {
 			runTurnCount = 0;
-			runHasAssistant = false;
 			continue;
 		}
 		if (message.role !== "assistant") continue;
 		runTurnCount++;
-		runHasAssistant = true;
 		const stampedTurns = (message as any)[WORKED_TURNS_KEY];
 		if (typeof stampedTurns === "number" && stampedTurns > 0) runTurnCount = stampedTurns;
 		if (message.stopReason !== "stop") continue;
@@ -209,7 +214,6 @@ function seedSessionTiming(messages: any[]): void {
 		(message as any)[WORKED_TURNS_KEY] = runTurnCount;
 	}
 	sessionWorkedTotalMs = workedTotalMs;
-	lastRunTurnCount = runHasAssistant ? runTurnCount : 0;
 }
 
 function sessionBranchMessages(ctx: any): any[] | undefined {
@@ -343,7 +347,6 @@ function registerWorkedTiming(pi: ExtensionAPI): void {
 				const durationMs = Math.max(0, Date.now() - started);
 				const turns = Math.max(1, currentRunTurnCount);
 				sessionWorkedTotalMs += durationMs;
-				lastRunTurnCount = turns;
 				(message as any)[WORKED_DURATION_KEY] = durationMs;
 				(message as any)[WORKED_SESSION_TOTAL_KEY] = sessionWorkedTotalMs;
 				(message as any)[WORKED_TURNS_KEY] = turns;
@@ -437,6 +440,47 @@ export function wrapWithActivity(record: any): any {
 		},
 		[ACTIVITY_WRAPPED]: true,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Native tool labeling (never replaces another extension's tool definition)
+// ---------------------------------------------------------------------------
+
+function registerBuiltinActivityTools(pi: ExtensionAPI): void {
+	const factories: Record<string, (cwd: string) => any> = {
+		read: createReadToolDefinition,
+		bash: createBashToolDefinition,
+		edit: createEditToolDefinition,
+		write: createWriteToolDefinition,
+		grep: createGrepToolDefinition,
+		find: createFindToolDefinition,
+		ls: createLsToolDefinition,
+	};
+	// At session_start all extensions have registered their tools. Only decorate
+	// definitions still owned by pi itself; never clobber a custom renderer,
+	// permission wrapper, or alternate implementation registered by a plugin.
+	pi.on("session_start", async (_event, ctx) => {
+		if (!toolActivityParamEnabled()) return;
+		const tools = pi.getAllTools();
+		const active = pi.getActiveTools();
+		let changed = false;
+		for (const info of tools) {
+			const factory = factories[info.name];
+			if (!factory || info.sourceInfo?.source !== "builtin") continue;
+			const definition = factory(ctx.cwd);
+			pi.registerTool(wrapWithActivity({
+				...definition,
+				execute(id: string, params: any, signal: any, onUpdate: any, toolCtx: any) {
+					// Session switches can change cwd without reloading this extension.
+					return factory(toolCtx?.cwd ?? ctx.cwd).execute(id, params, signal, onUpdate, toolCtx);
+				},
+			}));
+			changed = true;
+		}
+		// Registration activates tools by default. Do not enable optional built-ins
+		// or alter the user's selected loadout just to add a schema property.
+		if (changed) pi.setActiveTools(active);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,14 +1536,16 @@ function registerActivityFooter(pi: ExtensionAPI): void {
 			clear();
 			return;
 		}
-		const label = activity.label ?? DEFAULT_ACTIVITY_LABEL;
-		const text = `${label} · ${formatWorkedDuration(activity.labelElapsedMs)}`;
+		const label = activity.label ?? (activity.phase === "waiting" ? DEFAULT_ACTIVITY_LABEL : activity.phase);
+		const elapsed = activity.labelStartedAt === null ? activity.run.elapsedMs : activity.labelElapsedMs;
+		const text = `${label} · ${formatWorkedDuration(elapsed)}`;
 		try {
 			ui.setStatus?.(ACTIVITY_FOOTER_STATUS_KEY, text);
 		} catch { /* best effort */ }
-		stopTick();
-		tick = setInterval(publish, ACTIVITY_FOOTER_TICK_MS);
-		try { (tick as any)?.unref?.(); } catch { /* not a Node timer */ }
+		if (tick === null) {
+			tick = setInterval(publish, ACTIVITY_FOOTER_TICK_MS);
+			try { (tick as any)?.unref?.(); } catch { /* not a Node timer */ }
+		}
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1563,6 +1609,7 @@ export default function piActivity(pi: ExtensionAPI): void {
 	// Advertise the opt-in activity integration and start tracking activity
 	// before any tool registers or a run starts.
 	registerActivityApi(pi);
+	registerBuiltinActivityTools(pi);
 	// Stamp worked/thinking durations into messages so session totals and
 	// resume seeding survive restarts.
 	registerWorkedTiming(pi);

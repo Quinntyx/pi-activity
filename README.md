@@ -2,11 +2,11 @@
 
 Model-tagged activity labels and live activity tracking for
 [pi](https://github.com/earendil-works/pi). Extracted from
-[pi-tool-tree](../pi-tool-tree): the `activity` tool parameter, the
+[pi-tool-tree](https://git.quinntyx.dev/quinntyx/pi-tool-tree): the `activity` tool parameter, the
 what-is-the-agent-doing API, the label shimmer painter, and a footer status
 line — without any of the transcript rendering.
 
-- **The `activity` parameter** — tools wrapped by this extension ask the model
+- **The `activity` parameter** — native tools and tools wrapped by this extension ask the model
   to tag every call with at most two lowercase words naming the current phase
   (`exploring`, `implementing`, `fixing-types`). Labels are stripped before
   execution and kept in the recorded arguments, so they survive resume.
@@ -21,12 +21,24 @@ line — without any of the transcript rendering.
   in pi's footer status cluster, updating live, and going quiet when no run is
   active.
 
-Full API reference: [API.md](API.md).
+Full API reference: [API.md](API.md). Consumer updates and tree-removal audit:
+[MIGRATION.md](MIGRATION.md).
 
 ## Install
 
-As a pi package (clone or copy this directory into your pi packages
-directory), or load `extensions/index.ts` directly as an extension.
+Load it before plugins that opt into its API:
+
+```sh
+pi install git:git.quinntyx.dev/quinntyx/pi-activity
+```
+
+Remove `pi-tool-tree` from your enabled packages if you no longer want its
+rendering. This package neither changes nor depends on `pi-tool-tree`.
+
+At session start, native `read`, `bash`, `edit`, `write`, `grep`, `find`, and
+`ls` tools receive labels. Tools replaced by other extensions are left alone:
+their authors opt in using `wrapTool`, preserving their custom renderers. The
+active tool selection is preserved.
 
 ## Settings
 

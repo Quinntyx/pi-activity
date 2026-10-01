@@ -23,11 +23,13 @@ same instance** (so state and subscriptions are shared):
 > **Load order caveat:** when pi-tool-tree is *also* loaded, both extensions
 > publish to the legacy `pi-tool-tree:api` key, and whichever publishes last
 > (extension load order) decides which object sits there. This is safe for
-> consumers: every consumer of that key only needs the activity methods —
+> legacy consumers: those readers only need the activity methods —
 > `getActivity`, `getStats`, `subscribe`, `formatDuration`, `shimmerText`,
 > `wrapTool`, `param`, `defaultLabel`, `enabled`, `version`,
 > `shimmerIntervalMs` — which both objects provide. New code should prefer the
-> canonical `pi-activity:api` key.
+> canonical `pi-activity:api` key, which pi-tool-tree never publishes. pi-tool-tree
+> itself is unchanged and is not a dependency of this plugin. For a tree-free
+> setup, disable pi-tool-tree and load pi-activity before opt-in consumers.
 
 - [Quick start](#quick-start)
 - [`getActivity()`](#getactivity)
