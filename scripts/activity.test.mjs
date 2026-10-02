@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
 
 const scratch = mkdtempSync(join(tmpdir(), "pi-activity-test-"));
@@ -46,7 +47,12 @@ function host({ tools = [], active = [], hasUI = true, branch = [] } = {}) {
     api, ctx, statuses, registered,
     active: () => selected,
     async emit(event, data = {}) {
-      for (const fn of handlers.get(event) ?? []) await fn(data, ctx);
+      let result;
+      for (const fn of handlers.get(event) ?? []) {
+        const next = await fn(data, ctx);
+        if (next?.messages) { data = { ...data, messages: next.messages }; result = next; }
+      }
+      return result;
     },
   };
 }
@@ -86,16 +92,17 @@ test("opt-in wrapping preserves renderer identity and strips labels before execu
   assert.equal(wrapped.renderCall, renderCall);
   assert.equal(wrapped.renderResult, renderResult);
   assert.equal(original.parameters.properties.activity, undefined);
-  assert.ok(wrapped.parameters.properties.activity);
+  assert.equal(wrapped.parameters, original.parameters);
+  assert.equal(wrapped.parameters.properties.activity, undefined);
   assert.deepEqual(wrapped.parameters.required, ["path"]);
   assert.equal(h.api.wrapTool(wrapped), wrapped);
   const input = { path: " a ", activity: "testing" };
   const args = wrapped.prepareArguments(input);
-  assert.equal(prepared, input);
+  assert.deepEqual(prepared, { path: " a " });
   await wrapped.execute("x", args, undefined, undefined, h.ctx);
   assert.deepEqual(received, { path: "a" });
   assert.equal(input.activity, "testing");
-  assert.equal(wrapped.prepareArguments({ path: "a" }).activity, "working");
+  assert.deepEqual(wrapped.prepareArguments({ path: "a" }), { path: "a" });
   await h.emit("session_shutdown");
 });
 
@@ -108,7 +115,8 @@ test("native labels preserve active loadout and never replace another plugin's t
   const factories = { read: native.createReadToolDefinition, grep: native.createGrepToolDefinition };
   for (const tool of h.registered.values()) {
     const original = factories[tool.name](scratch);
-    assert.ok(tool.parameters.properties.activity);
+    assert.equal(tool.parameters.properties.activity, undefined);
+    assert.deepEqual(tool.parameters, original.parameters);
     assert.equal(tool.renderCall?.toString(), original.renderCall?.toString());
     assert.equal(tool.renderResult?.toString(), original.renderResult?.toString());
   }
@@ -122,7 +130,7 @@ test("wrapped native execution uses the current session cwd", async () => {
   mkdirSync(other);
   writeFileSync(join(other, "hello.txt"), "current session directory");
   const read = h.registered.get("read");
-  const result = await read.execute("read-1", { path: "hello.txt", activity: "checking" }, undefined, undefined, { ...h.ctx, cwd: other });
+  const result = await read.execute("read-1", { path: "hello.txt", activity: "testing" }, undefined, undefined, { ...h.ctx, cwd: other });
   assert.match(result.content[0].text, /current session directory/);
   await h.emit("session_shutdown");
 });
@@ -170,10 +178,10 @@ test("footer shows the activity, advances elapsed time and clears on idle/shutdo
   await h.emit("session_start");
   assert.equal(h.statuses.get("pi-activity"), undefined);
   await h.emit("agent_start");
-  await h.emit("tool_execution_start", { toolCallId: "a", toolName: "read", args: { activity: "checking" } });
-  assert.match(h.statuses.get("pi-activity"), /^checking · /);
+  await h.emit("tool_execution_start", { toolCallId: "a", toolName: "read", args: { activity: "testing" } });
+  assert.match(h.statuses.get("pi-activity"), /^testing · /);
   await new Promise((resolve) => setTimeout(resolve, 1100));
-  assert.match(h.statuses.get("pi-activity"), /^checking · 1s$/);
+  assert.match(h.statuses.get("pi-activity"), /^testing · 1s$/);
   await h.emit("tool_execution_end", { toolCallId: "a", toolName: "read", isError: false });
   await h.emit("agent_end");
   assert.equal(h.statuses.get("pi-activity"), undefined);
@@ -193,6 +201,126 @@ test("resume seeds tool stats and session transitions clear old run state", asyn
   await h.emit("session_start");
   assert.equal(h.api.getActivity().phase, "idle");
   assert.equal(h.api.getStats().toolCalls, 1);
+  await h.emit("session_shutdown");
+});
+
+
+test("only outgoing declarations gain a required enum, including later tool additions", async () => {
+  const h = host();
+  const original = { name: "direct_enum", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false }, execute: async () => ({ content: [] }) };
+  const wrapped = h.api.wrapTool(original);
+  const unwrapped = { ...original, name: "unwrapped" };
+  const raw = h.api.wrapTool({ ...original, name: "raw_grammar", constrainedSampling: { type: "grammar", variants: { openai_lark: "raw source" } } });
+  assert.equal(raw.parameters, original.parameters);
+  const messages = [
+    { role: "system", content: "prompt", toolsAdded: [wrapped, unwrapped, raw], timestamp: 1 },
+    { role: "user", content: "request", timestamp: 2 },
+    { role: "system", content: "later", toolsRemoved: [{ name: "other" }], toolsAdded: [wrapped], timestamp: 3 },
+  ];
+  const before = JSON.stringify(messages);
+  const result = await h.emit("context_with_system", { messages });
+  assert.equal(JSON.stringify(messages), before);
+  assert.equal(wrapped.parameters, original.parameters);
+  assert.equal(result.messages[1], messages[1]);
+  for (const index of [0, 2]) {
+    const schema = result.messages[index].toolsAdded[0].parameters;
+    assert.deepEqual(schema.required, ["path", "activity"]);
+    assert.deepEqual(schema.properties.activity.enum, [...mod.ACTIVITY_LABELS]);
+    assert.equal(schema.additionalProperties, false);
+    assert.ok(!schema.properties.activity.default);
+  }
+  assert.equal(result.messages[0].toolsAdded[1], unwrapped);
+  assert.equal(result.messages[0].toolsAdded[2], raw);
+  assert.deepEqual(result.messages[2].toolsRemoved, messages[2].toolsRemoved);
+  const again = await h.emit("context_with_system", result);
+  assert.deepEqual(again, result);
+  await h.emit("session_shutdown");
+});
+
+test("schema edge cases and tool-owned activity arguments are not hijacked", async () => {
+  assert.equal(mod.withActivityParam({ type: "string" }), undefined);
+  assert.equal(mod.withActivityParam({ type: "object", properties: [] }), undefined);
+  const existing = { type: "object", properties: { activity: { type: "number" } }, required: ["activity"] };
+  assert.equal(mod.withActivityParam(existing), undefined);
+  assert.deepEqual(mod.withActivityParam({ type: "object", properties: {} }).required, ["activity"]);
+  const h = host();
+  const tool = { name: "own_activity", parameters: existing, execute: async () => ({ content: [] }) };
+  assert.equal(h.api.wrapTool(tool), tool);
+  const result = await h.emit("context_with_system", { messages: [{ role: "system", toolsAdded: [tool] }] });
+  assert.equal(result.messages[0].toolsAdded[0], tool);
+  await h.emit("session_shutdown");
+});
+
+test("omitted and invalid labels inherit before persistence; unwrapped calls remain untouched", async () => {
+  const h = host({ hasUI: false });
+  h.api.wrapTool({ name: "fallback_enum", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [] }) });
+  await h.emit("session_start");
+  const first = { role: "assistant", content: [{ type: "toolCall", id: "initial", name: "fallback_enum", arguments: {} }] };
+  await h.emit("message_end", { message: first });
+  assert.equal(first.content[0].arguments.activity, "working");
+  const rawArgs = { activity: " TESTING " };
+  const message = { role: "assistant", content: [
+    { type: "toolCall", id: "valid", name: "fallback_enum", arguments: rawArgs },
+    { type: "toolCall", id: "missing", name: "fallback_enum", arguments: {} },
+    { type: "toolCall", id: "sentence", name: "fallback_enum", arguments: { activity: "checking the streaming usage" } },
+    { type: "toolCall", id: "suffix", name: "fallback_enum", arguments: { activity: "exploring-foo" } },
+    { type: "toolCall", id: "untouched", name: "codemode", arguments: { code: "await tools.read({path: 'x'})" } },
+  ] };
+  await h.emit("message_end", { message });
+  assert.equal(rawArgs.activity, " TESTING ");
+  assert.deepEqual(message.content.slice(0, 4).map((c) => c.arguments.activity), ["testing", "testing", "testing", "testing"]);
+  assert.equal(message.content[4].arguments.activity, undefined);
+  await h.emit("tool_execution_start", { toolCallId: "valid", toolName: "fallback_enum", args: message.content[0].arguments });
+  await h.emit("tool_execution_start", { toolCallId: "bad", toolName: "read", args: { activity: "a very long sentence" } });
+  assert.equal(h.api.getActivity().label, "testing");
+  const later = { role: "assistant", content: [{ type: "toolCall", id: "later", name: "fallback_enum", arguments: { activity: 123 } }] };
+  await h.emit("message_end", { message: later });
+  assert.equal(later.content[0].arguments.activity, "testing");
+  await h.emit("session_shutdown");
+});
+
+
+test("nested calls inherit their parent phase even when another call changes the current phase", async () => {
+  const h = host({ hasUI: false });
+  h.api.wrapTool({ name: "nested_enum", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [] }) });
+  await h.emit("session_start");
+  await h.emit("tool_execution_start", { toolCallId: "parent", toolName: "bash", args: { activity: "testing" } });
+  await h.emit("tool_execution_start", { toolCallId: "sibling", toolName: "read", args: { activity: "reviewing" } });
+  const args = {};
+  await h.emit("tool_execution_start", { toolCallId: "child", parentToolCallId: "parent", toolName: "nested_enum", args });
+  assert.equal(h.api.getActivity().calls.find((call) => call.toolCallId === "child").label, "testing");
+  assert.equal(args.activity, "testing");
+  await h.emit("session_shutdown");
+});
+
+test("installed Pi validates direct metadata and real codemode calls against the original strict schema", { skip: !process.env.PI_ACTIVITY_TEST_SDK }, async () => {
+  const sdk = pathToFileURL(process.env.PI_ACTIVITY_TEST_SDK);
+  const { runToolCall } = await import(new URL("../node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js", sdk));
+  const { executeCodemode } = await import(new URL("./extensions/codemode/execute.js", sdk));
+  const { wrapToolDefinition } = await import(new URL("./core/tools/tool-definition-wrapper.js", sdk));
+  const h = host({ hasUI: false });
+  const received = [];
+  const definition = h.api.wrapTool({
+    name: "strict_echo", label: "Echo", description: "Echo a path", exposure: "direct",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
+    execute: async (_id, args) => { received.push(args); return { content: [{ type: "text", text: args.path }] }; },
+  });
+  const tool = wrapToolDefinition(definition);
+  const context = { messages: [], tools: [tool] };
+  const assistantMessage = { role: "assistant", content: [], timestamp: 1 };
+  const direct = { type: "toolCall", id: "direct", name: tool.name, arguments: { path: "direct", activity: "testing" } };
+  const outcome = await runToolCall(direct, { context, assistantMessage });
+  assert.equal(outcome.isError, false, JSON.stringify(outcome.result));
+  assert.equal(direct.arguments.activity, "testing");
+  const result = await executeCodemode("script", { code: 'return await tools.strict_echo({path: "nested"});' }, new AbortController().signal, undefined, {
+    tools: [tool], sessionManager: { getBranch: () => [] },
+    executeTool: (name, args) => runToolCall({ type: "toolCall", id: "script/echo", name, arguments: args }, { context, assistantMessage }),
+  });
+  assert.notEqual(result.isError, true, JSON.stringify(result));
+  assert.equal(result.details.calls[0].status, "ok");
+  assert.deepEqual(received, [{ path: "direct" }, { path: "nested" }]);
+  assert.equal(tool.parameters.properties.activity, undefined);
+  assert.ok(result.content.some((c) => c.text?.includes("nested")));
   await h.emit("session_shutdown");
 });
 

@@ -6,10 +6,11 @@ Model-tagged activity labels and live activity tracking for
 what-is-the-agent-doing API, the label shimmer painter, and a footer status
 line — without any of the transcript rendering.
 
-- **The `activity` parameter** — native tools and tools wrapped by this extension ask the model
-  to tag every call with at most two lowercase words naming the current phase
-  (`exploring`, `implementing`, `fixing-types`). Labels are stripped before
-  execution and kept in the recorded arguments, so they survive resume.
+- **The `activity` parameter** — a required enum on model-facing tool calls:
+  `exploring`, `planning`, `implementing`, `debugging`, `testing`, `reviewing`,
+  `documenting`, or `working`. Reuse a phase until it changes. Callable schemas
+  stay unchanged for codemode and programmatic callers; metadata is stripped
+  before validation/execution and retained in recorded arguments for resume.
 - **Activity tracking** — a headless listener on pi's own events that answers
   what the agent is doing right now (`getActivity`), what it has done this
   session (`getStats`), and when either changes (`subscribe`). Correct in RPC,
@@ -26,7 +27,7 @@ Full API reference: [API.md](API.md). Consumer updates and tree-removal audit:
 
 ## Install
 
-Load it before plugins that opt into its API:
+Requires **Pi 0.99.1 or newer** (`context_with_system`). Load it before plugins that opt into its API:
 
 ```sh
 pi install git:git.quinntyx.dev/quinntyx/pi-activity
@@ -40,6 +41,14 @@ At session start, native `read`, `bash`, `edit`, `write`, `grep`, `find`, and
 their authors opt in using `wrapTool`, preserving their custom renderers. The
 active tool selection is preserved.
 
+Only outgoing `toolsAdded` declarations gain the required enum; registered
+schemas, codemode declarations, and programmatic calls remain unchanged. Raw
+grammar tools (including native codemode) and tools with their own `activity`
+argument are not modified. Nested calls inherit their parent's phase, or the
+current phase when there is no labeled parent. The first unlabeled phase is
+`working`. Omitted or invalid labels on wrapped direct calls are resolved before
+persistence so renderers reading recorded arguments see the same label.
+
 ## Settings
 
 Settings live beside pi's own `settings.json` (project `.pi/settings.json`,
@@ -48,7 +57,7 @@ Settings live beside pi's own `settings.json` (project `.pi/settings.json`,
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `toolActivityParam` | `true` | Inject the required `activity` param into wrapped tool schemas (`wrapTool`, `enabled()`). When off, labels fall back to the previous phase. |
+| `toolActivityParam` | `true` | Inject the required enum into wrapped tools' outgoing model declarations (`wrapTool`, `enabled()`). When off, labels fall back to the previous phase. |
 | `activityFooter` | `true` | Show the current activity (label + elapsed) in the footer status cluster. |
 | `themeAdaptive` | `true` | Derive shimmer colors from the active pi theme instead of the fixed fallbacks. |
 
@@ -87,3 +96,16 @@ if (api?.subscribe) {
 
 See [API.md](API.md) for the full surface, including `wrapTool` for tagging
 your own tools and `shimmerText` for the label sweep.
+
+## Development
+
+```sh
+npm test
+npm run typecheck
+# Also exercise strict validation and a real codemode sandbox against installed Pi:
+PI_ACTIVITY_TEST_SDK="$(npm root -g)/@earendil-works/pi-coding-agent/dist/index.js" npm test
+```
+
+The integration test is skipped when `PI_ACTIVITY_TEST_SDK` is unset. The older
+SDK in the development dependency tree is supported for source typechecking,
+not as a runtime for request-only activity injection.

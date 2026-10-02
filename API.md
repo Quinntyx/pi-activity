@@ -195,8 +195,23 @@ Also on the object: `shimmerIntervalMs` — the repaint cadence the sweep expect
 
 ## `wrapTool(tool)`
 
-Adds the `activity` parameter to a tool definition another extension registers,
-defaults a missing label, and strips it again before `execute` runs.
+Opts a tool into required activity metadata in outgoing model declarations.
+Its registered `parameters` object is unchanged: codemode/PTC still see the
+original schema and may call it without metadata. `prepareArguments` strips
+`activity` **before** the original preparation and schema validation; direct
+`execute` calls also strip it. Renderer identity and all other fields are kept.
+
+Model-facing `activity` values are `exploring`, `planning`, `implementing`,
+`debugging`, `testing`, `reviewing`, `documenting`, and `working`. Missing/invalid
+values continue the current phase (`working` initially). Wrapped direct calls
+have their recorded args resolved before persistence; nested execution events
+inherit their parent's phase. Historical free-form labels remain readable when
+resuming old sessions.
+
+Tools with an existing `activity` parameter or raw grammar constrained sampling
+are returned unchanged. In particular, native codemode's outer raw script is
+not given a required JSON field. This requires Pi 0.99.1+ for the
+`context_with_system` request-only hook.
 
 ```ts
 const api = (globalThis as any)[Symbol.for("pi-activity:api")];

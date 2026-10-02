@@ -16,7 +16,7 @@
  *    grouped rows (RPC, headless, tests).
  *
  * 2. Wrapping — the `activity` schema parameter the model tags every call
- *    with, injected into native tool schemas and opt-in tools via `wrapTool`.
+ *    with, injected into outgoing model declarations, not callable schemas.
  *    Existing extensions' tool definitions and custom renderers are left alone.
  *
  * 3. Presentation helpers — the shimmer painter (`shimmerText`) and the
@@ -39,7 +39,6 @@ import {
 	type ExtensionAPI,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 
 import { formatBashDuration } from "./bash-command";
 
@@ -52,7 +51,7 @@ const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 // ---------------------------------------------------------------------------
 
 interface SettingsFile {
-	/** Inject the required `activity` param into every wrapped tool schema. Default true. */
+	/** Inject required enum metadata into wrapped tools' model-facing declarations. Default true. */
 	toolActivityParam?: boolean;
 	/** Show the current activity (label + elapsed) in pi's footer status cluster. Default true. */
 	activityFooter?: boolean;
@@ -129,6 +128,14 @@ function activityFooterEnabled(): boolean {
 export const ACTIVITY_PARAM = "activity";
 export const ACTIVITY_WRAPPED = Symbol.for("pi-tool-tree:activity-wrapped");
 export const DEFAULT_ACTIVITY_LABEL = "working";
+/** Fixed phases advertised to the model. `working` is also the initial fallback. */
+export const ACTIVITY_LABELS = ["exploring", "planning", "implementing", "debugging", "testing", "reviewing", "documenting", "working"] as const;
+
+function enumActivityLabel(raw: unknown): string {
+	if (typeof raw !== "string") return "";
+	const label = raw.trim().toLowerCase();
+	return (ACTIVITY_LABELS as readonly string[]).includes(label) ? label : "";
+}
 
 /** Hard cap for a phase label. Long enough for two words, short enough that a
  *  rambling label cannot eat the group header. */
@@ -379,33 +386,24 @@ function registerWorkedTiming(pi: ExtensionAPI): void {
 // Tool wrapping: the `activity` parameter
 // ---------------------------------------------------------------------------
 
-/** Add the required `activity` param to a tool schema. Returns undefined when the
- *  schema shape can't safely carry it (then the tool is left unwrapped). */
+/** Add a required enum to a model-facing declaration, never a registered schema.
+ *  Tools with their own activity argument keep ownership of that argument. */
 export function withActivityParam(parameters: any): any | undefined {
-	if (!parameters || typeof parameters !== "object") return undefined;
-	if (parameters.type !== "object" || !parameters.properties || typeof parameters.properties !== "object") return undefined;
-	if (parameters.properties[ACTIVITY_PARAM]) return parameters;
-	if (Array.isArray(parameters.required) && parameters.required.includes(ACTIVITY_PARAM)) return parameters;
+	if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) return undefined;
+	if (parameters.type !== "object" || !parameters.properties || typeof parameters.properties !== "object" || Array.isArray(parameters.properties)) return undefined;
+	if (Object.hasOwn(parameters.properties, ACTIVITY_PARAM)) return undefined;
+	if (Array.isArray(parameters.required) && parameters.required.includes(ACTIVITY_PARAM)) return undefined;
 	return {
 		...parameters,
 		properties: {
 			...parameters.properties,
-			[ACTIVITY_PARAM]: Type.String({
-				description:
-					"REQUIRED tag for this call: at most TWO lowercase words naming the current phase. " +
-					"NEVER a phrase, sentence, or description — anything over two words is cut off. " +
-					"Good: 'exploring', 'implementing', 'fixing-types'. " +
-					"Bad: 'checking the streaming usage' (five words). " +
-					"Reuse the previous call's label when continuing the same activity.",
-				default: DEFAULT_ACTIVITY_LABEL,
-			}),
+			[ACTIVITY_PARAM]: {
+				type: "string",
+				enum: [...ACTIVITY_LABELS],
+				description: "Required phase. Reuse the same value until the phase changes.",
+			},
 		},
-		// Deliberately NOT appended to `required`: the wrapper defaults a missing label
-		// in `prepareArguments`, so the tool never actually needs it — and consumers that
-		// re-validate arguments against the advertised schema (pi-ptc-next mirrors these
-		// parameters for its Python callables) would otherwise reject every call that
-		// does not pass a label.
-		required: Array.isArray(parameters.required) ? parameters.required : [],
+		required: [...(Array.isArray(parameters.required) ? parameters.required : []), ACTIVITY_PARAM],
 	};
 }
 
@@ -416,30 +414,65 @@ export function stripActivityParam(args: any): any {
 	return rest;
 }
 
-/** Wrap a tool definition so the model tags each call with an activity label.
- *  The label lives in the recorded args (survives resume); execution never sees it. */
+// Only tools whose owners opted into argument stripping can advertise the extra
+// field. A custom tool's own activity argument, and raw grammar tools, are untouched.
+const activityWrappedToolNames = new Set<string>();
+
+/** Preserve the callable schema for codemode/PTC; strip metadata before validation. */
 export function wrapWithActivity(record: any): any {
 	if (!record || typeof record !== "object" || record[ACTIVITY_WRAPPED]) return record;
-	const parameters = withActivityParam(record.parameters);
-	if (!parameters) return record;
+	if (record.constrainedSampling?.type === "grammar" || !withActivityParam(record.parameters)) return record;
 	const originalExecute = record.execute;
 	const originalPrepare = typeof record.prepareArguments === "function" ? record.prepareArguments : undefined;
+	if (typeof record.name === "string") activityWrappedToolNames.add(record.name);
 	return {
 		...record,
-		parameters,
 		prepareArguments(args: any) {
-			const prepared = originalPrepare ? originalPrepare(args) : args;
-			const base = prepared && typeof prepared === "object" && !Array.isArray(prepared) ? prepared : {};
-			const label = typeof base[ACTIVITY_PARAM] === "string" && base[ACTIVITY_PARAM].trim() ? base[ACTIVITY_PARAM] : DEFAULT_ACTIVITY_LABEL;
-			// Return a copy: validation always sees a label, while the recorded
-			// tool-call arguments stay exactly what the model sent.
-			return { ...base, [ACTIVITY_PARAM]: label };
+			const clean = stripActivityParam(args);
+			return originalPrepare ? originalPrepare(clean) : clean;
 		},
 		async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
+			// Also protect callers that invoke execute directly without preparation.
 			return originalExecute(toolCallId, stripActivityParam(params), signal, onUpdate, ctx);
 		},
 		[ACTIVITY_WRAPPED]: true,
 	};
+}
+
+function registerModelActivityDeclarations(pi: ExtensionAPI): void {
+	// Keep source compatibility with the older SDK used by this package's tests.
+	// This request-only hook requires a Pi runtime with context_with_system (0.99.1+).
+	const on = pi.on.bind(pi) as unknown as (event: "context_with_system", handler: (event: { messages: any[] }) => any) => void;
+	on("context_with_system", (event) => {
+		if (!toolActivityParamEnabled()) return;
+		return {
+			messages: event.messages.map((message) => {
+				if (message.role !== "system" || !Array.isArray(message.toolsAdded)) return message;
+				return {
+					...message,
+					toolsAdded: message.toolsAdded.map((tool: any) => {
+						if (!activityWrappedToolNames.has(tool.name) || tool.constrainedSampling?.type === "grammar") return tool;
+						const parameters = withActivityParam(tool.parameters);
+						return parameters ? { ...tool, parameters } : tool;
+					}),
+				};
+			}),
+		};
+	});
+
+	// Resolve omissions/bad values before Pi persists the assistant message or
+	// publishes it to renderers. Do not add metadata to unwrapped/grammar tools.
+	pi.on("message_end", (event) => {
+		const message = event.message as any;
+		if (!toolActivityParamEnabled() || message?.role !== "assistant" || !Array.isArray(message.content)) return;
+		let label = activityState.label ?? DEFAULT_ACTIVITY_LABEL;
+		for (const block of message.content) {
+			if (block.type !== "toolCall" || !activityWrappedToolNames.has(block.name)) continue;
+			if (!block.arguments || typeof block.arguments !== "object" || Array.isArray(block.arguments)) continue;
+			label = enumActivityLabel(block.arguments[ACTIVITY_PARAM]) || label;
+			block.arguments = { ...block.arguments, [ACTIVITY_PARAM]: label };
+		}
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -929,10 +962,10 @@ function activityMessageEnd(event: any): void {
 /** Resolve the phase label for a call: what the model declared, else the label
  *  already in effect (unlabeled calls continue the current group), else the
  *  transcript's fallback label. */
-function activityResolveLabel(args: any): string {
-	const declared = normalizeActivityLabel(args?.[ACTIVITY_PARAM]);
+function activityResolveLabel(args: any, parentToolCallId?: string): string {
+	const declared = enumActivityLabel(args?.[ACTIVITY_PARAM]);
 	if (declared) return declared;
-	return activityState.label ?? DEFAULT_ACTIVITY_LABEL;
+	return (parentToolCallId ? activityState.calls.get(parentToolCallId)?.label : undefined) ?? activityState.label ?? DEFAULT_ACTIVITY_LABEL;
 }
 
 function activityToolStart(event: any): void {
@@ -942,7 +975,12 @@ function activityToolStart(event: any): void {
 	// mid-run (or a replayed event) should still report the call.
 	if (activityState.runStartedAt === null) activityStartRun();
 	const now = Date.now();
-	const label = activityResolveLabel(event?.args);
+	const label = activityResolveLabel(event?.args, event?.parentToolCallId);
+	if (toolActivityParamEnabled() && activityWrappedToolNames.has(event?.toolName) && event?.args && typeof event.args === "object" && !Array.isArray(event.args)) {
+		// Nested calls have no assistant message to normalize. Their event args are
+		// shared with the pending call; prepareArguments strips this before validation.
+		event.args[ACTIVITY_PARAM] = label;
+	}
 	if (label !== activityState.label) {
 		activityState.label = label;
 		activityState.labelStartedAt = now;
@@ -1610,6 +1648,7 @@ export default function piActivity(pi: ExtensionAPI): void {
 	// before any tool registers or a run starts.
 	registerActivityApi(pi);
 	registerBuiltinActivityTools(pi);
+	registerModelActivityDeclarations(pi);
 	// Stamp worked/thinking durations into messages so session totals and
 	// resume seeding survive restarts.
 	registerWorkedTiming(pi);

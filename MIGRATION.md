@@ -68,3 +68,15 @@ The bash duration formatter is already copied into this package; the rest of
 - pi-sock's standalone typecheck encounters a pre-existing undefined `pi` at
   `main/index.ts:431` (`pi.setSessionName(name.trim())`). The same statement is in
   HEAD; this migration does not change that handler.
+
+## Required enum / request-only declarations (dev)
+
+- Pi 0.99.1+ is required for `context_with_system`.
+- `wrapTool` no longer adds an optional free-form field to registered schemas.
+  It opts in to a required enum on outgoing model declarations only.
+- Codemode/PTC callers keep the original schema and need not pass `activity`.
+- Original `prepareArguments` hooks now receive arguments **without** activity
+  metadata. It is stripped before strict schema validation, not just execution.
+- Raw grammar tools and tools that own an `activity` argument are untouched.
+- Invalid/omitted direct labels inherit the current phase before persistence;
+  nested calls inherit their parent's phase. Old recorded labels are retained.
